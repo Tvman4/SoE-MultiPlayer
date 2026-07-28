@@ -1,0 +1,157 @@
+name: SoE Multiplayer iOS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Stable Xcode Version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prepare Web Assets
+        run: |
+          set -e
+          if [ ! -f www/index.html ]; then
+            mkdir -p www
+            if [ -f index.html ]; then
+              cp index.html www/index.html
+            elif ls *.html 1>/dev/null 2>&1; then
+              cp "$(ls *.html | head -1)" www/index.html
+            else
+              echo "ERROR: No .html file found in www/ or repo root."
+              exit 1
+            fi
+          fi
+
+      - name: Install Dependencies & Initialize iOS Structure
+        run: |
+          set -e
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/ios
+          
+          rm -rf ios
+          npx cap add ios || true
+
+      - name: Configure App Name in Capacitor Config
+        run: |
+          set -e
+          # Update capacitor.config.json or create one if it doesn't exist with the correct app name
+          if [ -f capacitor.config.json ]; then
+            node -e '
+              const fs = require("fs");
+              const config = JSON.parse(fs.readFileSync("capacitor.config.json", "utf8"));
+              config.appName = "SoE Multiplayer iOS";
+              fs.writeFileSync("capacitor.config.json", JSON.stringify(config, null, 2));
+            '
+          else
+            echo '{
+              "appId": "com.soe.multiplayer",
+              "appName": "SoE Multiplayer iOS",
+              "webDir": "www",
+              "bundledWebRuntime": false
+            }' > capacitor.config.json
+          fi
+
+      - name: Force iOS Deployment Target to 18.0 in Project & Podfile
+        run: |
+          set -e
+          PODFILE="ios/App/Podfile"
+          PROJECT_FILE="ios/App/App.xcodeproj/project.pbxproj"
+          
+          # Force main project deployment target to 18.0
+          if [ -f "$PROJECT_FILE" ]; then
+            sed -i '' "s/IPHONEOS_DEPLOYMENT_TARGET = .*/IPHONEOS_DEPLOYMENT_TARGET = 18.0;/g" "$PROJECT_FILE"
+            echo "Main project deployment target updated to 18.0."
+          fi
+
+          # Configure Podfile deployment target and post_install hook
+          if [ -f "$PODFILE" ]; then
+            sed -i '' "s/platform :ios, .*/platform :ios, '18.0'/" "$PODFILE"
+            
+            if grep -q "post_install" "$PODFILE"; then
+              echo "Existing post_install found."
+            else
+              cat << 'EOF' >> "$PODFILE"
+
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              target.build_configurations.each do |config|
+                config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '18.0'
+              end
+            end
+          end
+          EOF
+            fi
+            echo "Podfile configured successfully."
+          else
+            echo "ERROR: Podfile was not generated."
+            exit 1
+          fi
+
+      - name: Sync Capacitor iOS & Install Pods
+        run: |
+          set -e
+          npx cap update ios
+          cd ios/App
+          pod install
+
+      - name: Generate and Apply iOS Icons
+        run: |
+          set -e
+          if [ -f resources/icon.png ]; then
+            ICON_DIR="ios/App/App/Assets.xcassets/AppIcon.appiconset"
+            mkdir -p "$ICON_DIR"
+            sips -z 1024 1024 resources/icon.png --out "$ICON_DIR/icon-1024.png"
+            
+            echo '{' > "$ICON_DIR/Contents.json"
+            echo '  "images" : [' >> "$ICON_DIR/Contents.json"
+            echo '    {' >> "$ICON_DIR/Contents.json"
+            echo '      "filename" : "icon-1024.png",' >> "$ICON_DIR/Contents.json"
+            echo '      "idiom" : "universal",' >> "$ICON_DIR/Contents.json"
+            echo '      "platform" : "ios",' >> "$ICON_DIR/Contents.json"
+            echo '      "size" : "1024x1024"' >> "$ICON_DIR/Contents.json"
+            echo '    }' >> "$ICON_DIR/Contents.json"
+            echo '  ],' >> "$ICON_DIR/Contents.json"
+            echo '  "info" : {' >> "$ICON_DIR/Contents.json"
+            echo '    "author" : "xcode",' >> "$ICON_DIR/Contents.json"
+            echo '    "version" : 1' >> "$ICON_DIR/Contents.json"
+            echo '  }' >> "$ICON_DIR/Contents.json"
+            echo '}' >> "$ICON_DIR/Contents.json"
+          fi
+
+      - name: Archive (no code signing)
+        run: |
+          cd ios/App
+          xcodebuild -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath $PWD/build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      - name: Pack unsigned IPA
+        run: |
+          cd ios/App
+          mkdir -p Payload
+          cp -r build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -r SoE-Multiplayer-iOS-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SOE-ios-unsigned-ipa
+          path: ios/App/SoE-Multiplayer-iOS-unsigned.ipa
